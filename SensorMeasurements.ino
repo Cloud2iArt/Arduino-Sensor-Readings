@@ -71,12 +71,18 @@ void updateRpm(unsigned long now) {
 }
 
 // -------------------------- INA226 voltage inputs --------------------------
-const byte INA226_ADDRESSES[2] = {0x40, 0x41}; // Set A0/A1 straps differently.
+// Fixed motor order from SERIAL_PROTOCOL.md; never infer it from scan order.
+const byte INA226_ADDRESSES[2] = {0x41, 0x40}; // Motor 1, motor 2; separate A0/A1 straps.
+const unsigned long INA226_RETRY_INTERVAL_MS = 1000;
 const byte INA226_CONFIG_REGISTER = 0x00;
 const byte INA226_BUS_VOLTAGE_REGISTER = 0x02;
 const uint16_t INA226_CONTINUOUS_CONFIG = 0x4127;
 const float INA226_BUS_VOLTAGE_LSB = 0.00125F;
 bool ina226Ready[2] = {false, false};
+unsigned long ina226LastAttemptMs[2] = {0, 0};
+uint16_t voltageRaw[2] = {0, 0};
+bool voltageRawAvailable[2] = {false, false};
+int currentRaw[2] = {0, 0};
 float Voltage[2] = {NAN, NAN};
 bool writeIna226Register(byte address, byte reg, uint16_t value) {
   Wire.beginTransmission(address);
@@ -85,12 +91,14 @@ bool writeIna226Register(byte address, byte reg, uint16_t value) {
   Wire.write(static_cast<byte>(value));
   return Wire.endTransmission() == 0;
 }
-  bool readIna226Register(byte address, byte reg, uint16_t &value) {
+bool readIna226Register(byte address, byte reg, uint16_t &value) {
   Wire.beginTransmission(address);
   Wire.write(reg);
- if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.endTransmission(false) != 0) return false;
   if (Wire.requestFrom(address, static_cast<byte>(2)) != 2) return false;
-  value = (static_cast<uint16_t>(Wire.read()) << 8) | Wire.read();
+  const byte highByte = Wire.read();
+  const byte lowByte = Wire.read();
+  value = (static_cast<uint16_t>(highByte) << 8) | lowByte;
   return true;
 }
 
@@ -99,6 +107,7 @@ void setupVoltageSensors() {
   Wire.setClock(100000UL);
   Wire.setWireTimeout(25000UL, true); // Bound stuck I2C transactions (AVR core 1.8.6).
   for (byte sensor = 0; sensor < 2; ++sensor) {
+    ina226LastAttemptMs[sensor] = millis();
     ina226Ready[sensor] = writeIna226Register(
         INA226_ADDRESSES[sensor], INA226_CONFIG_REGISTER,
         INA226_CONTINUOUS_CONFIG);
@@ -110,10 +119,25 @@ void setupVoltageSensors() {
 }
 
 bool readBusVoltage(byte sensor, float &volts) {
+  volts = NAN;
+  if (!ina226Ready[sensor]) {
+    const unsigned long now = millis();
+    if (now - ina226LastAttemptMs[sensor] < INA226_RETRY_INTERVAL_MS) return false;
+    ina226LastAttemptMs[sensor] = now;
+    ina226Ready[sensor] = writeIna226Register(
+        INA226_ADDRESSES[sensor], INA226_CONFIG_REGISTER, INA226_CONTINUOUS_CONFIG);
+    // Allow the first conversion to complete before using the register.
+    return false;
+  }
   uint16_t raw;
-  if (!ina226Ready[sensor] ||
-      !readIna226Register(INA226_ADDRESSES[sensor],
-                          INA226_BUS_VOLTAGE_REGISTER, raw)) return false;
+  if (!readIna226Register(INA226_ADDRESSES[sensor],
+                         INA226_BUS_VOLTAGE_REGISTER, raw)) {
+    ina226Ready[sensor] = false;
+    ina226LastAttemptMs[sensor] = millis();
+    return false;
+  }
+  voltageRaw[sensor] = raw;
+  voltageRawAvailable[sensor] = true;
   volts = raw * INA226_BUS_VOLTAGE_LSB;
   return true;
 }
@@ -132,7 +156,8 @@ void setupCurrentSensors() {
 float readCurrentAmps(byte sensor) {
   unsigned long total = 0;
   for (byte sample = 0; sample < CURRENT_SAMPLE_COUNT; ++sample) {
-    total += analogRead(CURRENT_PINS[sensor]);
+    currentRaw[sensor] = analogRead(CURRENT_PINS[sensor]);
+    total += currentRaw[sensor];
   }
   const float volts = (total / static_cast<float>(CURRENT_SAMPLE_COUNT)) *
                       ADC_REFERENCE_VOLTS / 1023.0F;
@@ -147,7 +172,7 @@ struct SampleAverage {
   float total = 0.0F;
   unsigned long count = 0;
   void add(float value) {
-    if (!isnan(value)) {
+    if (isfinite(value)) {
       total += value;
       ++count;
     }
@@ -205,6 +230,19 @@ void printTelemetry() {
   for (byte i = 0; i < 2; ++i) printValue(Current[i], 3);
   Serial.println(F(",nan,nan,nan")); // Throttles and E-stop belong to motor Uno.
 }
+void printRawTelemetry() {
+  Serial.print(F("RAW,")); Serial.print(millis());
+  for (byte sensor = 0; sensor < 2; ++sensor) {
+    Serial.print(',');
+    if (voltageRawAvailable[sensor]) Serial.print(voltageRaw[sensor]);
+    else Serial.print(F("UNAVAILABLE"));
+    voltageRawAvailable[sensor] = false;
+  }
+  for (byte sensor = 0; sensor < 2; ++sensor) {
+    Serial.print(','); Serial.print(currentRaw[sensor]);
+  }
+  Serial.println();
+}
 void setup() {
   Serial.begin(115200);
   printIdentity();
@@ -224,7 +262,7 @@ void loop() {
     updateRpm(now);
     finishTelemetryWindow();
     printTelemetry();
+    printRawTelemetry();
   }
-  Serial.print("Current Value: ");
-Serial.println(Voltage[0]);
 }
+
