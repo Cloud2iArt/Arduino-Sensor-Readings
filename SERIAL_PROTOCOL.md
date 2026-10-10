@@ -210,7 +210,7 @@ time for freshness checks: Arduino uptime resets on reboot and wraps eventually.
 ## I2C addressing versus UI mapping
 
 I2C addresses are not transmitted in these records. Motor assignments are made
-in firmware; the UI follows field positions. The firmware assigns motor 1 to `0x41` and motor 2 to `0x40`, matching the supplied protocol. Verify the physical address straps and wire each INA226 bus input to its corresponding motor supply. Both devices must have distinct addresses. INA226 addresses are in the range `0x40`–`0x4F`; `0x55` is not a supported INA226 address.
+in firmware; the UI follows field positions. The firmware assigns motor 1 to `0x55` and motor 2 to `0x40`, using the hardware owner’s confirmed addresses. This confirmation supersedes the earlier document’s motor 1 address of `0x41`. Each device is read independently using the existing bus-voltage register and scaling; the UI mapping remains unchanged. Hardware communication has not been verified in this environment.
 
 ## Firmware verification
 

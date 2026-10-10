@@ -71,8 +71,8 @@ void updateRpm(unsigned long now) {
 }
 
 // -------------------------- INA226 voltage inputs --------------------------
-// Fixed motor order from SERIAL_PROTOCOL.md; never infer it from scan order.
-const byte INA226_ADDRESSES[2] = {0x41, 0x40}; // Motor 1, motor 2; separate A0/A1 straps.
+// Fixed motor order confirmed by the hardware owner; never infer it from scan order.
+const byte INA226_ADDRESSES[2] = {0x55, 0x40}; // Motor 1, motor 2; user-confirmed hardware addresses.
 const unsigned long INA226_RETRY_INTERVAL_MS = 1000;
 const byte INA226_CONFIG_REGISTER = 0x00;
 const byte INA226_BUS_VOLTAGE_REGISTER = 0x02;

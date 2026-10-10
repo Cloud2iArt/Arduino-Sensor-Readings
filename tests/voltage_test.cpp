@@ -3,9 +3,9 @@
 #include <algorithm>
 #include "../SensorMeasurements.ino"
 int main() {
-  Wire.present[0x41] = false;
+  Wire.present[0x55] = false;
   Wire.present[0x40] = true;
-  Wire.raw[0x41] = 9876; // 12.345 V, motor 1
+  Wire.raw[0x55] = 9876; // 12.345 V, motor 1
   Wire.raw[0x40] = 9589; // 11.98625 V, motor 2
   setupVoltageSensors();
   assert(Serial.output.str() == "ERROR,INA226_NOT_FOUND,1\r\n");
@@ -16,9 +16,9 @@ int main() {
   auto text = Serial.output.str();
   assert(text.find(",nan,11.986,") != std::string::npos);
   assert(text.find("RAW,0,UNAVAILABLE,9589,512,520\r\n") != std::string::npos);
-  Wire.present[0x41] = true;
+  Wire.present[0x55] = true;
   fakeNow=999; sampleTelemetry();
-  assert(Wire.configs[0x41] == 1); // no tight retry loop
+  assert(Wire.configs[0x55] == 1); // no tight retry loop
   fakeNow=1000; sampleTelemetry(); // configure recovered sensor
   fakeNow=1005; sampleTelemetry(); finishTelemetryWindow();
   assert(fabs(Voltage[0] - 12.345F) < 0.00001F);
@@ -28,13 +28,13 @@ int main() {
   assert(text.find(",12.345,11.986,") != std::string::npos);
   assert(text.find("RAW,1005,9876,9589,512,520\r\n") != std::string::npos);
   // Failed runtime reads must not reuse last window's voltage or RAW value.
-  Wire.shortRead[0x41]=true;
+  Wire.shortRead[0x55]=true;
   Wire.raw[0x40]=0;
   sampleTelemetry(); finishTelemetryWindow();
   assert(isnan(Voltage[0]) && Voltage[1] == 0);
   Serial.clear(); printTelemetry(); printRawTelemetry();
   assert(Serial.output.str().find("UNAVAILABLE,0,512,520") != std::string::npos);
-  Wire.shortRead[0x41]=false;
+  Wire.shortRead[0x55]=false;
   fakeNow=2005; sampleTelemetry();
   fakeNow=2010; sampleTelemetry(); finishTelemetryWindow();
   assert(fabs(Voltage[0]-12.345F) < 0.00001F && Voltage[1] == 0);
