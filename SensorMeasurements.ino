@@ -209,7 +209,7 @@ void finishTelemetryWindow() {
   }
 }
 
-const float TORQUE_ARM_METERS[2] = {1.0F, 1.0F}; // Replace with measured lever arms.
+const float TORQUE_ARM_METERS[2] = {0.031569F, 0.031569F}; // Replace with measured lever arms.
 void printIdentity() { Serial.println(F("DEVICE,SENSORS,2")); }
 void processCommand(char *command) {
   if (strcmp(command, "ID?") == 0) printIdentity();

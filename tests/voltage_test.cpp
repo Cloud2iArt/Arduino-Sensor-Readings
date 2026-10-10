@@ -1,5 +1,6 @@
 #include <cassert>
 #include <iostream>
+#include <algorithm>
 #include "../SensorMeasurements.ino"
 int main() {
   Wire.present[0x41] = false;
@@ -42,6 +43,11 @@ int main() {
   fakeNow += 500; loop();
   text=Serial.output.str();
   assert(text.find("DATA,") == 0 && text.find("RAW,") != std::string::npos);
+  auto newline=text.find("\r\n");
+  assert(newline != std::string::npos);
+  assert(std::count(text.begin(), text.begin()+newline, ',') == 14);
+  assert(text.substr(newline-12, 12) == ",nan,nan,nan");
+  assert(text.find("RAW,") == newline+2);
   assert(text.find("Current Value") == std::string::npos);
   std::cout << "PASS: independent I2C channels, scaling, zero, startup/runtime recovery, per-window availability, DATA/RAW framing and quiet loop\n";
 }
