@@ -71,7 +71,7 @@ void updateRpm(unsigned long now) {
 }
 
 // -------------------------- INA226 voltage inputs --------------------------
-const byte INA226_ADDRESSES[2] = {0x40, 0x41}; // Set A0/A1 straps differently.
+const byte INA226_ADDRESSES[2] = {0x55, 0x40}; // Set A0/A1 straps differently.
 const byte INA226_CONFIG_REGISTER = 0x00;
 const byte INA226_BUS_VOLTAGE_REGISTER = 0x02;
 const uint16_t INA226_CONTINUOUS_CONFIG = 0x4127;
@@ -184,7 +184,7 @@ void finishTelemetryWindow() {
   }
 }
 
-const float TORQUE_ARM_METERS[2] = {1.0F, 1.0F}; // Replace with measured lever arms.
+const float TORQUE_ARM_METERS[2] = {0.031569F, 0.031569F}; // Replace with measured lever arms.
 void printIdentity() { Serial.println(F("DEVICE,SENSORS,2")); }
 void processCommand(char *command) {
   if (strcmp(command, "ID?") == 0) printIdentity();
@@ -203,7 +203,7 @@ void printTelemetry() {
   for (byte i = 0; i < 2; ++i) printValue(rpm[i], 1);
   for (byte i = 0; i < 2; ++i) printValue(Voltage[i], 3);
   for (byte i = 0; i < 2; ++i) printValue(Current[i], 3);
-  Serial.println(F(",nan,nan,nan")); // Throttles and E-stop belong to motor Uno.
+  //Serial.println(F(",nan,nan,nan")); // Throttles and E-stop belong to motor Uno.
 }
 void setup() {
   Serial.begin(115200);
@@ -224,7 +224,6 @@ void loop() {
     updateRpm(now);
     finishTelemetryWindow();
     printTelemetry();
+
   }
-  Serial.print("Current Value: ");
-Serial.println(Voltage[0]);
 }
