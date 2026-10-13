@@ -6,32 +6,36 @@
 
 // ----------------------------- Pin assignment ------------------------------
 const byte RPM_PINS[2] = {2, 3};              // TCRT5000 digital outputs
-const byte HX711_DATA_PINS[4] = {4, 5, 6, 8}; // One DOUT per amplifier
-const byte HX711_CLOCK_PIN = 7;                // Shared PD_SCK
+// HX711 DOUT: M1 thrust=4, M1 torque=5, M2 thrust=6, M2 torque=8.
+// HX711 shared clock=7; raw transport wiring is in ForceReader.cpp.
 const byte CURRENT_PINS[2] = {A0, A1};         // ACS724 analogue outputs
 // INA226 SDA and SCL use the board's hardware I2C pins (A4 and A5 on an Uno).
 // ---------------------------- Load-cell system -----------------------------
-// Load-cell output uses per-cell calibration equations in ForceReader.cpp.
-const byte LOAD_CELL_SAMPLES = 1;
-const byte LOAD_CELL_TARE_SAMPLES = 32;
+// Each load has its own raw count, tare zero and force in newtons (N).
+// Calibration input = raw ADC count * 9.81, as specified for these equations.
+// Force (N) = slope * (raw ADC count * 9.81) + intercept (N).
+// Scale the input before calibration; do not multiply the intercept or output.
+// Signed slopes preserve calibration direction.
+// Tare with the rig unloaded: subtract the calibrated unloaded force from
+// subsequent readings. The intercept cancels, but is shown in both equations.
+const byte LOAD_CELL_TARE_SAMPLES = 32; // Average noise in the unloaded zero.
 const unsigned long LOAD_CELL_STARTUP_SETTLE_MS = 1000;
-const float TORQUE_ARM_METERS[2] = {0.031569F, 0.031569F};
-ForceReader loadCells(HX711_DATA_PINS, 4, HX711_CLOCK_PIN);
-float TORQUE_LOAD_CELL[2] = {NAN, NAN};
-float THRUST_LOAD_CELL[2] = {NAN, NAN};
-void setupLoadCells() {
-  loadCells.begin();
-  delay(LOAD_CELL_STARTUP_SETTLE_MS);
-  if (loadCells.tare(LOAD_CELL_TARE_SAMPLES, 100)) {
-    Serial.println(F("READY,LOAD_CELLS_TARED"));
-  } else {
-    Serial.println(F("ERROR,LOAD_CELL_TARE_FAILED"));
-  }
-}
-bool readLoadCellForces() {
-  return loadCells.readForcePairsNewtons(
-    TORQUE_LOAD_CELL, THRUST_LOAD_CELL, LOAD_CELL_SAMPLES, 0);
-}
+const float M1_TORQUE_ARM_METERS = 0.031569F;
+const float M2_TORQUE_ARM_METERS = 0.031569F;
+ForceReader loadCells; // Only handles synchronized raw ADC acquisition.
+bool tareRequested = false; // Serial TARE is performed explicitly in loop().
+long m1ThrustRaw = 0;
+float m1ThrustTareNewtons = 0.0F;
+float m1ThrustNewtons = NAN; // No force sample yet.
+long m1TorqueRaw = 0;
+float m1TorqueTareNewtons = 0.0F;
+float m1TorqueNewtons = NAN; // No force sample yet.
+long m2ThrustRaw = 0;
+float m2ThrustTareNewtons = 0.0F;
+float m2ThrustNewtons = NAN; // No force sample yet.
+long m2TorqueRaw = 0;
+float m2TorqueTareNewtons = 0.0F;
+float m2TorqueNewtons = NAN; // No force sample yet.
 
 // ------------------------------ RPM sensors --------------------------------
 const unsigned long TELEMETRY_INTERVAL_MS = 500;
@@ -158,16 +162,13 @@ struct SampleAverage {
   float value() const { return count ? total / count : NAN; }
   void reset() { total = 0.0F; count = 0; }
 };
-SampleAverage torqueSamples[2], thrustSamples[2];
+SampleAverage m1ThrustSamples; // Independent valid-sample average.
+SampleAverage m1TorqueSamples; // Independent valid-sample average.
+SampleAverage m2ThrustSamples; // Independent valid-sample average.
+SampleAverage m2TorqueSamples; // Independent valid-sample average.
 SampleAverage voltageSamples[2], currentSamples[2];
 void sampleTelemetry() {
-  // A zero timeout polls HX711 readiness without waiting for a conversion.
-  const bool forceValid = readLoadCellForces();
   for (byte sensor = 0; sensor < 2; ++sensor) {
-    if (forceValid) {
-      torqueSamples[sensor].add(TORQUE_LOAD_CELL[sensor]);
-      thrustSamples[sensor].add(THRUST_LOAD_CELL[sensor]);
-    }
     float volts;
     if (readBusVoltage(sensor, volts)) voltageSamples[sensor].add(volts);
     currentSamples[sensor].add(readCurrentAmps(sensor));
@@ -175,39 +176,51 @@ void sampleTelemetry() {
 }
 
 void finishTelemetryWindow() {
+  // Publish each independent mean; an empty window reports nan.
+  m1ThrustNewtons = m1ThrustSamples.value();
+  m1ThrustSamples.reset();
+  m1TorqueNewtons = m1TorqueSamples.value();
+  m1TorqueSamples.reset();
+  m2ThrustNewtons = m2ThrustSamples.value();
+  m2ThrustSamples.reset();
+  m2TorqueNewtons = m2TorqueSamples.value();
+  m2TorqueSamples.reset();
+
   for (byte sensor = 0; sensor < 2; ++sensor) {
-    TORQUE_LOAD_CELL[sensor] = torqueSamples[sensor].value();
-    THRUST_LOAD_CELL[sensor] = thrustSamples[sensor].value();
     Voltage[sensor] = voltageSamples[sensor].value();
     Current[sensor] = currentSamples[sensor].value();
-    torqueSamples[sensor].reset();
-    thrustSamples[sensor].reset();
     voltageSamples[sensor].reset();
     currentSamples[sensor].reset();
   }
 }
 
 void resetTelemetryAverages() {
+  m1ThrustSamples.reset();
+  m1TorqueSamples.reset();
+  m2ThrustSamples.reset();
+  m2TorqueSamples.reset();
+
   for (byte sensor = 0; sensor < 2; ++sensor) {
-    torqueSamples[sensor].reset();
-    thrustSamples[sensor].reset();
     voltageSamples[sensor].reset();
     currentSamples[sensor].reset();
   }
 }
 
 void printRawLoadCellDiagnostics() {
-  long rawCounts[4];
-  if (!loadCells.readRawAverage(rawCounts, LOAD_CELL_TARE_SAMPLES, 100)) {
+  long m1ThrustDiagnostic;
+  long m1TorqueDiagnostic;
+  long m2ThrustDiagnostic;
+  long m2TorqueDiagnostic;
+  if (!loadCells.readRawAverage(m1ThrustDiagnostic, m1TorqueDiagnostic, m2ThrustDiagnostic, m2TorqueDiagnostic, LOAD_CELL_TARE_SAMPLES, 100)) {
     Serial.println(F("ERROR,RAW_LOAD_CELLS"));
     return;
   }
 
   Serial.print(F("RAW_LOAD_CELLS,M1_THRUST,M1_TORQUE,M2_THRUST,M2_TORQUE"));
-  for (byte channel = 0; channel < 4; ++channel) {
-    Serial.print(',');
-    Serial.print(rawCounts[channel]);
-  }
+  Serial.print(','); Serial.print(m1ThrustDiagnostic); // Motor 1 thrust ADC counts.
+  Serial.print(','); Serial.print(m1TorqueDiagnostic); // Motor 1 torque ADC counts.
+  Serial.print(','); Serial.print(m2ThrustDiagnostic); // Motor 2 thrust ADC counts.
+  Serial.print(','); Serial.print(m2TorqueDiagnostic); // Motor 2 torque ADC counts.
   Serial.println();
 }
 
@@ -216,12 +229,7 @@ void processCommand(char *command) {
   if (strcmp(command, "ID?") == 0) printIdentity();
   else if (strcmp(command, "RAW?") == 0) printRawLoadCellDiagnostics();
   else if (strcmp(command, "TARE") == 0) {
-    if (loadCells.tare(LOAD_CELL_TARE_SAMPLES, 100)) {
-      resetTelemetryAverages();
-      Serial.println(F("OK,TARE"));
-    } else {
-      Serial.println(F("ERROR,TARE_FAILED"));
-    }
+    tareRequested = true; // loop() measures and calculates each tare zero.
   }
   else Serial.println(F("ERROR,BAD_COMMAND"));
 }
@@ -234,10 +242,12 @@ void printValue(float value, byte decimals) {
 void printTelemetry() {
   Serial.print(F("DATA,")); Serial.print(millis());
   // UI order: torque1, torque2, thrust1, thrust2.
-  for (byte i = 0; i < 2; ++i) {
-    printValue(TORQUE_LOAD_CELL[i] * TORQUE_ARM_METERS[i], 3);
-  }
-  for (byte i = 0; i < 2; ++i) printValue(THRUST_LOAD_CELL[i], 3);
+  // Torque (N m) = tangential load (N) * perpendicular arm length (m).
+  // Six decimals retain small torque responses that rounded to 0.000 N m.
+  printValue(m1TorqueNewtons * M1_TORQUE_ARM_METERS, 6);
+  printValue(m2TorqueNewtons * M2_TORQUE_ARM_METERS, 6);
+  printValue(m1ThrustNewtons, 3); // Axial thrust already in newtons.
+  printValue(m2ThrustNewtons, 3);
   for (byte i = 0; i < 2; ++i) printValue(rpm[i], 1);
   for (byte i = 0; i < 2; ++i) printValue(Voltage[i], 3);
   for (byte i = 0; i < 2; ++i) printValue(Current[i], 3);
@@ -248,13 +258,63 @@ void setup() {
   printIdentity();
   setupVoltageSensors();
   setupCurrentSensors();
-  setupLoadCells();
+  loadCells.begin();
+  delay(LOAD_CELL_STARTUP_SETTLE_MS); // Allow amplifiers to settle before zeroing.
+  // Keep each old tare if acquisition fails; replace zeros only on success.
+  if (loadCells.readRawAverage(m1ThrustRaw, m1TorqueRaw, m2ThrustRaw, m2TorqueRaw,
+                               LOAD_CELL_TARE_SAMPLES, 100)) {
+    // Motor 1 thrust: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+    m1ThrustTareNewtons = (-4.032515e-7F * (m1ThrustRaw * 9.81F) + (-15.7562F));
+    // Motor 1 torque: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+    m1TorqueTareNewtons = (-1.665536e-8F * (m1TorqueRaw * 9.81F) + (-4.4866F));
+    // Motor 2 thrust: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+    m2ThrustTareNewtons = (-5.944979e-7F * (m2ThrustRaw * 9.81F) + (2.1752F));
+    // Motor 2 torque: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+    m2TorqueTareNewtons = (-1.345070e-8F * (m2TorqueRaw * 9.81F) + (-2.3490F));
+    Serial.println(F("READY,LOAD_CELLS_TARED"));
+  } else {
+    Serial.println(F("ERROR,LOAD_CELL_TARE_FAILED"));
+  }
   setupRpmSensors();
   lastTelemetryMs = rpmSampleStartedMs;
   Serial.println(F("READY,SENSORS"));
 }
 void loop() {
   serviceSerialCommands();
+  if (tareRequested) {
+    tareRequested = false;
+    // Keep each old tare if acquisition fails; replace zeros only on success.
+    if (loadCells.readRawAverage(m1ThrustRaw, m1TorqueRaw, m2ThrustRaw, m2TorqueRaw,
+                                 LOAD_CELL_TARE_SAMPLES, 100)) {
+      // Motor 1 thrust: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+      m1ThrustTareNewtons = (-4.032515e-7F * (m1ThrustRaw * 9.81F) + (-15.7562F));
+      // Motor 1 torque: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+      m1TorqueTareNewtons = (-1.665536e-8F * (m1TorqueRaw * 9.81F) + (-4.4866F));
+      // Motor 2 thrust: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+      m2ThrustTareNewtons = (-5.944979e-7F * (m2ThrustRaw * 9.81F) + (2.1752F));
+      // Motor 2 torque: tare (N) = slope * (mean unloaded ADC * 9.81) + intercept (N).
+      m2TorqueTareNewtons = (-1.345070e-8F * (m2TorqueRaw * 9.81F) + (-2.3490F));
+      resetTelemetryAverages(); // Never mix samples from before and after tare.
+      Serial.println(F("OK,TARE"));
+    } else {
+      Serial.println(F("ERROR,TARE_FAILED"));
+    }
+  }
+  // Poll the shared-clock acquisition; no ready conversion means no new sample.
+  if (loadCells.readRawAverage(m1ThrustRaw, m1TorqueRaw, m2ThrustRaw, m2TorqueRaw, 1, 0)) {
+    // Motor 1 thrust: scale raw ADC by 9.81, calibrate to N, then subtract its own tare (N).
+    m1ThrustNewtons = (-4.032515e-7F * (m1ThrustRaw * 9.81F) + (-15.7562F)) - m1ThrustTareNewtons;
+    m1ThrustSamples.add(m1ThrustNewtons);
+    // Motor 1 torque: scale raw ADC by 9.81, calibrate to N, then subtract its own tare (N).
+    m1TorqueNewtons = (-1.665536e-8F * (m1TorqueRaw * 9.81F) + (-4.4866F)) - m1TorqueTareNewtons;
+    m1TorqueSamples.add(m1TorqueNewtons);
+    // Motor 2 thrust: scale raw ADC by 9.81, calibrate to N, then subtract its own tare (N).
+    m2ThrustNewtons = (-5.944979e-7F * (m2ThrustRaw * 9.81F) + (2.1752F)) - m2ThrustTareNewtons;
+    m2ThrustSamples.add(m2ThrustNewtons);
+    // Motor 2 torque: scale raw ADC by 9.81, calibrate to N, then subtract its own tare (N).
+    m2TorqueNewtons = (-1.345070e-8F * (m2TorqueRaw * 9.81F) + (-2.3490F)) - m2TorqueTareNewtons;
+    m2TorqueSamples.add(m2TorqueNewtons);
+  }
   sampleTelemetry();
   const unsigned long now = millis();
   if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
