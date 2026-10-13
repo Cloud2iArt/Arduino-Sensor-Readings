@@ -1,7 +1,23 @@
 #include "ForceReader.h"
 
 namespace {
-const float STANDARD_GRAVITY = 9.80665F;
+struct CalibrationEquation {
+  float slope;
+  float intercept;
+};
+
+const float STANDARD_GRAVITY = 9.81F;
+
+// F = (a * F_raw + b) * g
+const CalibrationEquation M1_THRUST_CALIBRATION = {-4.032515e-7F, -15.7562F};
+const CalibrationEquation M1_TORQUE_CALIBRATION = {-1.665536e-8F, -4.4866F};
+const CalibrationEquation M2_THRUST_CALIBRATION = {-5.944979e-7F, 2.1752F};
+const CalibrationEquation M2_TORQUE_CALIBRATION = {-1.345070e-8F, -2.3490F};
+
+float applyCalibration(long rawReading, const CalibrationEquation &calibration) {
+  return (calibration.slope * rawReading + calibration.intercept) *
+         STANDARD_GRAVITY;
+}
 }
 
 ForceReader::ForceReader(const byte *dataPins, byte channelCount, byte clockPin)
@@ -9,43 +25,54 @@ ForceReader::ForceReader(const byte *dataPins, byte channelCount, byte clockPin)
       clockPin_(clockPin) {
   for (byte channel = 0; channel < MAX_CHANNELS; ++channel) {
     dataPins_[channel] = channel < channelCount_ ? dataPins[channel] : 0;
-    zeroOffsets_[channel] = 0;
-    calibrationFactors_[channel] = 1.0F;
+    tareOffsets_[channel] = 0.0F;
   }
 }
 
- void ForceReader::begin(const float *calibrationFactorsCountsPerKg) {
+void ForceReader::begin() {
   pinMode(clockPin_, OUTPUT);
   digitalWrite(clockPin_, LOW);  // HIGH for >60 us powers down every HX711.
   for (byte channel = 0; channel < channelCount_; ++channel) {
     pinMode(dataPins_[channel], INPUT);
-    // Assign this directly rather than calling another member during startup.
-    // A zero factor is invalid because force conversion divides by this value.
-    const float factor = calibrationFactorsCountsPerKg[channel];
-    calibrationFactors_[channel] = factor == 0.0F ? 1.0F : factor;
+  }
+}
+
+bool ForceReader::tare(byte sampleCount, unsigned long timeoutMs) {
+  long readings[MAX_CHANNELS];
+  if (channelCount_ != MAX_CHANNELS ||
+      !readRawAverage(readings, sampleCount, timeoutMs)) {
+    return false;
   }
 
-}
- 
- bool ForceReader::tare(byte sampleCount, unsigned long timeoutMs) {
-  long readings[MAX_CHANNELS];
-  if (!readRawAverage(readings, sampleCount, timeoutMs)) return false;
-  for (byte channel = 0; channel < channelCount_; ++channel) {
-    zeroOffsets_[channel] = readings[channel];
-  }
+  tareOffsets_[0] = applyCalibration(readings[0], M1_THRUST_CALIBRATION);
+  tareOffsets_[1] = applyCalibration(readings[1], M1_TORQUE_CALIBRATION);
+  tareOffsets_[2] = applyCalibration(readings[2], M2_THRUST_CALIBRATION);
+  tareOffsets_[3] = applyCalibration(readings[3], M2_TORQUE_CALIBRATION);
   return true;
- }
+}
+
+void ForceReader::clearTare() {
+  for (byte channel = 0; channel < MAX_CHANNELS; ++channel) {
+    tareOffsets_[channel] = 0.0F;
+  }
+}
 
 bool ForceReader::readForceNewtons(float *forceNewtons, byte sampleCount,
                                    unsigned long timeoutMs) {
   long readings[MAX_CHANNELS];
   if (!readRawAverage(readings, sampleCount, timeoutMs)) return false;
-  for (byte channel = 0; channel < channelCount_; ++channel) {
-    const float massKg =
-        (readings[channel] - zeroOffsets_[channel]) / calibrationFactors_[channel];
-    forceNewtons[channel] = massKg * STANDARD_GRAVITY;
+  if (channelCount_ == MAX_CHANNELS) {
+    forceNewtons[0] = applyCalibration(readings[0], M1_THRUST_CALIBRATION) -
+                      tareOffsets_[0];
+    forceNewtons[1] = applyCalibration(readings[1], M1_TORQUE_CALIBRATION) -
+                      tareOffsets_[1];
+    forceNewtons[2] = applyCalibration(readings[2], M2_THRUST_CALIBRATION) -
+                      tareOffsets_[2];
+    forceNewtons[3] = applyCalibration(readings[3], M2_TORQUE_CALIBRATION) -
+                      tareOffsets_[3];
+    return true;
   }
-  return true;
+  return false;
 }
 
 bool ForceReader::readForcePairsNewtons(float *firstPairNewtons,
@@ -58,35 +85,24 @@ bool ForceReader::readForcePairsNewtons(float *firstPairNewtons,
     return false;
   }
 
-  for (byte channel = 0; channel < channelCount_; ++channel) {
-    const float massKg =
-        (readings[channel] - zeroOffsets_[channel]) /
-        calibrationFactors_[channel];
-    float forceNewtons = massKg * STANDARD_GRAVITY;
-    if (channel < 2) {
-      // Torque load cells: channels 0 and 1.
-      forceNewtons =
-          1.50323425e-6F * forceNewtons + 0.29719284F;
-    } else {
-      // Thrust load cells: channels 2 and 3.
-      forceNewtons =
-          -6.45519948e-8F * forceNewtons; //+ 3.33527235F//;
-    }
-
-    float *outputPair = channel < 2 ? firstPairNewtons
-                                    : secondPairNewtons;
-    outputPair[channel % 2] = forceNewtons;
-  }
+  firstPairNewtons[0] = applyCalibration(readings[1], M1_TORQUE_CALIBRATION) -
+                        tareOffsets_[1];
+  firstPairNewtons[1] = applyCalibration(readings[3], M2_TORQUE_CALIBRATION) -
+                        tareOffsets_[3];
+  secondPairNewtons[0] = applyCalibration(readings[0], M1_THRUST_CALIBRATION) -
+                         tareOffsets_[0];
+  secondPairNewtons[1] = applyCalibration(readings[2], M2_THRUST_CALIBRATION) -
+                         tareOffsets_[2];
   return true;
 }
-  
+
 bool ForceReader::readRawAverage(long *rawCounts, byte sampleCount,
                                  unsigned long timeoutMs) {
   if (sampleCount == 0 || channelCount_ == 0) return false;
-    int64_t totals[MAX_CHANNELS] = {0, 0, 0, 0};
+  int64_t totals[MAX_CHANNELS] = {0, 0, 0, 0};
   long readings[MAX_CHANNELS];
   for (byte sample = 0; sample < sampleCount; ++sample) {
-     if (!waitUntilReady(timeoutMs)) return false;
+    if (!waitUntilReady(timeoutMs)) return false;
     readRawSimultaneously(readings);
     for (byte channel = 0; channel < channelCount_; ++channel) {
       totals[channel] += readings[channel];
@@ -98,12 +114,7 @@ bool ForceReader::readRawAverage(long *rawCounts, byte sampleCount,
   return true;
 }
 
-long ForceReader::zeroOffset(byte channel) const {
-  return channel < channelCount_ ? zeroOffsets_[channel] : 0;
-}
-
-
-  bool ForceReader::waitUntilReady(unsigned long timeoutMs) const {
+bool ForceReader::waitUntilReady(unsigned long timeoutMs) const {
   const unsigned long start = millis();
   while (true) {
     bool allReady = true;
@@ -113,11 +124,11 @@ long ForceReader::zeroOffset(byte channel) const {
         break;
       }
     }
-   if (allReady) return true;
+    if (allReady) return true;
     if (millis() - start >= timeoutMs) return false;
   }
-
 }
+
 void ForceReader::readRawSimultaneously(long *rawCounts) {
   uint32_t values[MAX_CHANNELS] = {0, 0, 0, 0};
 
@@ -131,7 +142,7 @@ void ForceReader::readRawSimultaneously(long *rawCounts) {
     digitalWrite(clockPin_, LOW);
     delayMicroseconds(1);
   }
-    // Pulse 25 selects channel A, gain 128, for every amplifier's next sample.
+  // Pulse 25 selects channel A, gain 128, for every amplifier's next sample.
   digitalWrite(clockPin_, HIGH);
   delayMicroseconds(1);
   digitalWrite(clockPin_, LOW);

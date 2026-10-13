@@ -11,22 +11,25 @@ const byte HX711_CLOCK_PIN = 7;                // Shared PD_SCK
 const byte CURRENT_PINS[2] = {A0, A1};         // ACS724 analogue outputs
 // INA226 SDA and SCL use the board's hardware I2C pins (A4 and A5 on an Uno).
 // ---------------------------- Load-cell system -----------------------------
-// Replace these four values after calibrating each load cell. They are signed
-// raw HX711 counts per kilogram; leaving a value at 1 does NOT give calibrated N.
-const float LOAD_CELL_COUNTS_PER_KG[4] = {1.0F, 1.0F, 1.0F, 1.0F};
+// Load-cell output uses per-cell calibration equations in ForceReader.cpp.
 const byte LOAD_CELL_SAMPLES = 1;
+const byte LOAD_CELL_TARE_SAMPLES = 32;
+const unsigned long LOAD_CELL_STARTUP_SETTLE_MS = 1000;
+const float TORQUE_ARM_METERS[2] = {0.031569F, 0.031569F};
 ForceReader loadCells(HX711_DATA_PINS, 4, HX711_CLOCK_PIN);
 float TORQUE_LOAD_CELL[2] = {NAN, NAN};
 float THRUST_LOAD_CELL[2] = {NAN, NAN};
-bool loadCellsTared = false;
 void setupLoadCells() {
-  loadCells.begin(LOAD_CELL_COUNTS_PER_KG);
-  Serial.println(F("INFO,Remove all loads; taring four load cells"));
-  loadCellsTared = loadCells.tare(10, 250);
-  if (!loadCellsTared) Serial.println(F("ERROR,HX711_TARE"));
+  loadCells.begin();
+  delay(LOAD_CELL_STARTUP_SETTLE_MS);
+  if (loadCells.tare(LOAD_CELL_TARE_SAMPLES, 100)) {
+    Serial.println(F("READY,LOAD_CELLS_TARED"));
+  } else {
+    Serial.println(F("ERROR,LOAD_CELL_TARE_FAILED"));
+  }
 }
 bool readLoadCellForces() {
-  return loadCellsTared && loadCells.readForcePairsNewtons(
+  return loadCells.readForcePairsNewtons(
     TORQUE_LOAD_CELL, THRUST_LOAD_CELL, LOAD_CELL_SAMPLES, 0);
 }
 
@@ -184,10 +187,42 @@ void finishTelemetryWindow() {
   }
 }
 
-const float TORQUE_ARM_METERS[2] = {0.031569F, 0.031569F}; // Replace with measured lever arms.
+void resetTelemetryAverages() {
+  for (byte sensor = 0; sensor < 2; ++sensor) {
+    torqueSamples[sensor].reset();
+    thrustSamples[sensor].reset();
+    voltageSamples[sensor].reset();
+    currentSamples[sensor].reset();
+  }
+}
+
+void printRawLoadCellDiagnostics() {
+  long rawCounts[4];
+  if (!loadCells.readRawAverage(rawCounts, LOAD_CELL_TARE_SAMPLES, 100)) {
+    Serial.println(F("ERROR,RAW_LOAD_CELLS"));
+    return;
+  }
+
+  Serial.print(F("RAW_LOAD_CELLS,M1_THRUST,M1_TORQUE,M2_THRUST,M2_TORQUE"));
+  for (byte channel = 0; channel < 4; ++channel) {
+    Serial.print(',');
+    Serial.print(rawCounts[channel]);
+  }
+  Serial.println();
+}
+
 void printIdentity() { Serial.println(F("DEVICE,SENSORS,2")); }
 void processCommand(char *command) {
   if (strcmp(command, "ID?") == 0) printIdentity();
+  else if (strcmp(command, "RAW?") == 0) printRawLoadCellDiagnostics();
+  else if (strcmp(command, "TARE") == 0) {
+    if (loadCells.tare(LOAD_CELL_TARE_SAMPLES, 100)) {
+      resetTelemetryAverages();
+      Serial.println(F("OK,TARE"));
+    } else {
+      Serial.println(F("ERROR,TARE_FAILED"));
+    }
+  }
   else Serial.println(F("ERROR,BAD_COMMAND"));
 }
 #include "SerialCommands.h"
@@ -198,12 +233,15 @@ void printValue(float value, byte decimals) {
 }
 void printTelemetry() {
   Serial.print(F("DATA,")); Serial.print(millis());
-  for (byte i = 0; i < 2; ++i) printValue(TORQUE_LOAD_CELL[i] * TORQUE_ARM_METERS[i], 3);
+  // UI order: torque1, torque2, thrust1, thrust2.
+  for (byte i = 0; i < 2; ++i) {
+    printValue(TORQUE_LOAD_CELL[i] * TORQUE_ARM_METERS[i], 3);
+  }
   for (byte i = 0; i < 2; ++i) printValue(THRUST_LOAD_CELL[i], 3);
   for (byte i = 0; i < 2; ++i) printValue(rpm[i], 1);
   for (byte i = 0; i < 2; ++i) printValue(Voltage[i], 3);
   for (byte i = 0; i < 2; ++i) printValue(Current[i], 3);
-  //Serial.println(F(",nan,nan,nan")); // Throttles and E-stop belong to motor Uno.
+  Serial.println(F(",nan,nan,nan")); // Throttles and E-stop belong to motor Uno.
 }
 void setup() {
   Serial.begin(115200);
