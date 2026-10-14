@@ -1,65 +1,182 @@
 #include "ForceReader.h"
 
-void ForceReader::begin() {
-  pinMode(7, OUTPUT); // Shared HX711 PD_SCK.
-  digitalWrite(7, LOW); // Holding HIGH for >60 us powers down the amplifiers.
-  pinMode(4, INPUT); // Motor 1 thrust DOUT.
-  pinMode(5, INPUT); // Motor 1 torque DOUT.
-  pinMode(6, INPUT); // Motor 2 thrust DOUT.
-  pinMode(8, INPUT); // Motor 2 torque DOUT.
+namespace {
+struct CalibrationEquation {
+  float slope;
+  float intercept;
+};
+
+const float STANDARD_GRAVITY = 9.81F;
+
+// F = (a * F_raw + b) * g
+const CalibrationEquation M1_THRUST_CALIBRATION = {-4.032515e-6F, -15.7562F};
+const CalibrationEquation M1_TORQUE_CALIBRATION = {-1.665536e-8F, -4.4866F};
+const CalibrationEquation M2_THRUST_CALIBRATION = {-5.944979e-6F, 2.1752F};
+const CalibrationEquation M2_TORQUE_CALIBRATION = {-1.345070e-8F, -2.3490F};
+
+// Least-squares slopes of cross-thrust versus torque from torque-only loads.
+// Both supplied columns were HX711 counts * 9.81, so their common scale cancels.
+// F_thrust_corrected = F_thrust_tared - coupling * F_torque_tared.
+// coupling = rawCrossSlope * thrustCalibrationSlope / torqueCalibrationSlope.
+// The regression intercept is removed by a shared unloaded tare, not subtracted
+// again here. Torque here is load-cell force (N), before the torque arm (N m).
+const float M1_RAW_CROSS_SLOPE = 0.003766579995F;
+const float M2_RAW_CROSS_SLOPE = 0.006503315979F;
+const float M1_CROSS_COUPLING = M1_RAW_CROSS_SLOPE *
+    M1_THRUST_CALIBRATION.slope / M1_TORQUE_CALIBRATION.slope;
+const float M2_CROSS_COUPLING = M2_RAW_CROSS_SLOPE *
+    M2_THRUST_CALIBRATION.slope / M2_TORQUE_CALIBRATION.slope;
+
+float applyCalibration(long rawReading, const CalibrationEquation &calibration) {
+  return (calibration.slope * rawReading + calibration.intercept) *
+         STANDARD_GRAVITY;
+}
 }
 
-bool ForceReader::readRawAverage(long &m1Thrust, long &m1Torque, long &m2Thrust, long &m2Torque,
-                                  byte sampleCount, unsigned long timeoutMs) {
-  if (sampleCount == 0) return false; // Cannot average zero samples.
-  int64_t m1ThrustTotal = 0; // Wide accumulator prevents overflow during tare.
-  int64_t m1TorqueTotal = 0; // Wide accumulator prevents overflow during tare.
-  int64_t m2ThrustTotal = 0; // Wide accumulator prevents overflow during tare.
-  int64_t m2TorqueTotal = 0; // Wide accumulator prevents overflow during tare.
-  for (byte sample = 0; sample < sampleCount; ++sample) {
-    const unsigned long start = millis();
-    // LOW means a conversion is ready. A zero timeout gives a nonblocking poll.
-    // Reading one amplifier alone would consume the other three conversions.
-    while (digitalRead(4) != LOW || digitalRead(5) != LOW ||
-           digitalRead(6) != LOW || digitalRead(8) != LOW) {
-      if (millis() - start >= timeoutMs) return false;
-    }
-    uint32_t m1ThrustBits = 0;
-    uint32_t m1TorqueBits = 0;
-    uint32_t m2ThrustBits = 0;
-    uint32_t m2TorqueBits = 0;
-    // Keep clock HIGH pulses short even when RPM interrupts are active.
-    noInterrupts();
-    for (byte bit = 0; bit < 24; ++bit) {
-      digitalWrite(7, HIGH);
-      delayMicroseconds(1);
-      // Shift each sensor's own serial bit into its own 24-bit reading.
-      m1ThrustBits = (m1ThrustBits << 1) | digitalRead(4);
-      m1TorqueBits = (m1TorqueBits << 1) | digitalRead(5);
-      m2ThrustBits = (m2ThrustBits << 1) | digitalRead(6);
-      m2TorqueBits = (m2TorqueBits << 1) | digitalRead(8);
-      digitalWrite(7, LOW);
-      delayMicroseconds(1);
-    }
-    // Pulse 25 selects channel A, gain 128, for the next conversion on all four.
-    digitalWrite(7, HIGH);
-    delayMicroseconds(1);
-    digitalWrite(7, LOW);
-    interrupts();
-    // Sign-extend each two's-complement 24-bit ADC value to signed 32 bits.
-    if (m1ThrustBits & 0x00800000UL) m1ThrustBits |= 0xFF000000UL;
-    m1ThrustTotal += static_cast<int32_t>(m1ThrustBits);
-    if (m1TorqueBits & 0x00800000UL) m1TorqueBits |= 0xFF000000UL;
-    m1TorqueTotal += static_cast<int32_t>(m1TorqueBits);
-    if (m2ThrustBits & 0x00800000UL) m2ThrustBits |= 0xFF000000UL;
-    m2ThrustTotal += static_cast<int32_t>(m2ThrustBits);
-    if (m2TorqueBits & 0x00800000UL) m2TorqueBits |= 0xFF000000UL;
-    m2TorqueTotal += static_cast<int32_t>(m2TorqueBits);
+ForceReader::ForceReader(const byte *dataPins, byte channelCount, byte clockPin)
+    : channelCount_(channelCount > MAX_CHANNELS ? MAX_CHANNELS : channelCount),
+      clockPin_(clockPin) {
+  for (byte channel = 0; channel < MAX_CHANNELS; ++channel) {
+    dataPins_[channel] = channel < channelCount_ ? dataPins[channel] : 0;
+    tareOffsets_[channel] = 0.0F;
   }
-  // Average each cell independently; publish only after all samples succeed.
-  m1Thrust = static_cast<long>(m1ThrustTotal / sampleCount);
-  m1Torque = static_cast<long>(m1TorqueTotal / sampleCount);
-  m2Thrust = static_cast<long>(m2ThrustTotal / sampleCount);
-  m2Torque = static_cast<long>(m2TorqueTotal / sampleCount);
+}
+
+void ForceReader::begin() {
+  pinMode(clockPin_, OUTPUT);
+  digitalWrite(clockPin_, LOW);  // HIGH for >60 us powers down every HX711.
+  for (byte channel = 0; channel < channelCount_; ++channel) {
+    pinMode(dataPins_[channel], INPUT);
+  }
+}
+
+bool ForceReader::tare(byte sampleCount, unsigned long timeoutMs) {
+  long readings[MAX_CHANNELS];
+  if (channelCount_ != MAX_CHANNELS ||
+      !readRawAverage(readings, sampleCount, timeoutMs)) {
+    return false;
+  }
+
+  tareOffsets_[0] = applyCalibration(readings[0], M1_THRUST_CALIBRATION);
+  tareOffsets_[1] = applyCalibration(readings[1], M1_TORQUE_CALIBRATION);
+  tareOffsets_[2] = applyCalibration(readings[2], M2_THRUST_CALIBRATION);
+  tareOffsets_[3] = applyCalibration(readings[3], M2_TORQUE_CALIBRATION);
   return true;
+}
+
+void ForceReader::clearTare() {
+  for (byte channel = 0; channel < MAX_CHANNELS; ++channel) {
+    tareOffsets_[channel] = 0.0F;
+  }
+}
+
+bool ForceReader::readForceNewtons(float *forceNewtons, byte sampleCount,
+                                   unsigned long timeoutMs) {
+  long readings[MAX_CHANNELS];
+  if (!readRawAverage(readings, sampleCount, timeoutMs)) return false;
+  if (channelCount_ == MAX_CHANNELS) {
+    forceNewtons[0] = (applyCalibration(readings[0], M1_THRUST_CALIBRATION) -
+                      tareOffsets_[0])*2;
+    forceNewtons[1] = (applyCalibration(readings[1], M1_TORQUE_CALIBRATION) -
+                      tareOffsets_[1])*1.75;
+    forceNewtons[2] = (applyCalibration(readings[2], M2_THRUST_CALIBRATION) -
+                      tareOffsets_[2])*2;
+    forceNewtons[3] = (applyCalibration(readings[3], M2_TORQUE_CALIBRATION) -
+                      tareOffsets_[3])*1.75;
+    // Positive torque subtracts cross-talk; negative torque adds its magnitude.
+    // Zero torque leaves the calibrated thrust unchanged.
+    if (forceNewtons[M1_TORQUE] > 0.0F) {
+      forceNewtons[M1_THRUST] -=
+          (M1_CROSS_COUPLING * forceNewtons[M1_TORQUE])/1.75;
+    } else if (forceNewtons[M1_TORQUE] < 0.0F) {
+      forceNewtons[M1_THRUST] +=
+          (M1_CROSS_COUPLING * (-forceNewtons[M1_TORQUE]))/1.75;
+    }
+    if (forceNewtons[M2_TORQUE] > 0.0F) {
+      forceNewtons[M2_THRUST] -=
+          (M2_CROSS_COUPLING * forceNewtons[M2_TORQUE])/1.75;
+    } else if (forceNewtons[M2_TORQUE] < 0.0F) {
+      forceNewtons[M2_THRUST] +=
+          (M2_CROSS_COUPLING * (-forceNewtons[M2_TORQUE]))/1.75;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool ForceReader::readForcePairsNewtons(float *torqueNewtons,
+                                        float *thrustNewtons,
+                                        byte sampleCount,
+                                        unsigned long timeoutMs) {
+  float forces[MAX_CHANNELS];
+  if (!readForceNewtons(forces, sampleCount, timeoutMs)) {
+    return false;
+  }
+
+  torqueNewtons[0] = forces[M1_TORQUE];
+  torqueNewtons[1] = forces[M2_TORQUE];
+  thrustNewtons[0] = forces[M1_THRUST];
+  thrustNewtons[1] = forces[M2_THRUST];
+  return true;
+}
+
+bool ForceReader::readRawAverage(long *rawCounts, byte sampleCount,
+                                 unsigned long timeoutMs) {
+  if (sampleCount == 0 || channelCount_ == 0) return false;
+  int64_t totals[MAX_CHANNELS] = {0, 0, 0, 0};
+  long readings[MAX_CHANNELS];
+  for (byte sample = 0; sample < sampleCount; ++sample) {
+    if (!waitUntilReady(timeoutMs)) return false;
+    readRawSimultaneously(readings);
+    for (byte channel = 0; channel < channelCount_; ++channel) {
+      totals[channel] += readings[channel];
+    }
+  }
+  for (byte channel = 0; channel < channelCount_; ++channel) {
+    rawCounts[channel] = static_cast<long>(totals[channel] / sampleCount);
+  }
+  return true;
+}
+
+bool ForceReader::waitUntilReady(unsigned long timeoutMs) const {
+  const unsigned long start = millis();
+  while (true) {
+    bool allReady = true;
+    for (byte channel = 0; channel < channelCount_; ++channel) {
+      if (digitalRead(dataPins_[channel]) == HIGH) {
+        allReady = false;
+        break;
+      }
+    }
+    if (allReady) return true;
+    if (millis() - start >= timeoutMs) return false;
+  }
+}
+
+void ForceReader::readRawSimultaneously(long *rawCounts) {
+  uint32_t values[MAX_CHANNELS] = {0, 0, 0, 0};
+
+  noInterrupts();
+  for (byte bit = 0; bit < 24; ++bit) {
+    digitalWrite(clockPin_, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(clockPin_, LOW);
+    // DOUT holds the shifted bit until the next rising edge. Sample while
+    // PD_SCK is low so reading several pins cannot stretch its high pulse.
+    for (byte channel = 0; channel < channelCount_; ++channel) {
+      values[channel] = (values[channel] << 1) | digitalRead(dataPins_[channel]);
+    }
+    delayMicroseconds(1);
+  }
+  // Pulse 25 selects channel A, gain 128, for every amplifier's next sample.
+  digitalWrite(clockPin_, HIGH);
+  delayMicroseconds(1);
+  digitalWrite(clockPin_, LOW);
+  interrupts();
+
+  for (byte channel = 0; channel < channelCount_; ++channel) {
+    rawCounts[channel] = (values[channel] & 0x00800000UL)
+        ? static_cast<long>(values[channel]) - 0x01000000L
+        : static_cast<long>(values[channel]);
+  }
 }
